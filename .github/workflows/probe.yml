@@ -1,0 +1,144 @@
+name: Probe Counter
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"       # every 15 minutes
+  workflow_dispatch:
+    inputs:
+      FAIL_RATE:
+        description: "Percent chance [0..100] to fail"
+        required: false
+        default: "25"
+        type: string
+      NOTES:
+        description: "Optional note (shows in summary & artifact)"
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Debug env & context
+        run: |
+            echo "Repo: $GITHUB_REPOSITORY"
+            echo "Run ID: $GITHUB_RUN_ID"
+            echo "Attempt: $GITHUB_RUN_ATTEMPT"
+            echo "Event: $GITHUB_EVENT_NAME"
+            echo "Input FAIL_RATE: '${{ github.event.inputs.FAIL_RATE }}'"
+            echo "Input NOTES: '${{ github.event.inputs.NOTES }}'"
+
+      - name: Decide outcome
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Choose fail rate: manual input overrides default
+          FAIL_RATE="${{ github.event.inputs.FAIL_RATE }}"
+          if [[ -z "${FAIL_RATE}" ]]; then FAIL_RATE="25"; fi
+
+          # Validate integer 0..100
+          if ! [[ "${FAIL_RATE}" =~ ^[0-9]+$ ]] || (( FAIL_RATE < 0 || FAIL_RATE > 100 )); then
+            echo "Invalid FAIL_RATE='${FAIL_RATE}'. Must be 0..100. Defaulting to 25."
+            FAIL_RATE="25"
+          fi
+
+          # Random 0..99
+          R=$(( RANDOM % 100 ))
+          if (( R < FAIL_RATE )); then
+            OUTCOME="failure"
+            MESSAGE="Probe failed on purpose (r=${R} < ${FAIL_RATE})"
+            EXITCODE=1
+          else
+            OUTCOME="success"
+            MESSAGE="Probe succeeded (r=${R} >= ${FAIL_RATE})"
+            EXITCODE=0
+          fi
+
+          echo "fail_rate=${FAIL_RATE}"        | tee -a "$GITHUB_OUTPUT"
+          echo "rand=${R}"                     | tee -a "$GITHUB_OUTPUT"
+          echo "outcome=${OUTCOME}"            | tee -a "$GITHUB_OUTPUT"
+          echo "message=${MESSAGE}"            | tee -a "$GITHUB_OUTPUT"
+          echo "exitcode=${EXITCODE}"          | tee -a "$GITHUB_OUTPUT"
+
+      - name: Produce result.json (always)
+        id: result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+
+          START_TS=$(date +%s)
+          # lightweight probe, treat creation time as start/end
+          END_TS=$(date +%s)
+
+          # Make NOTES safe (can be empty)
+          NOTES_INPUT='${{ github.event.inputs.NOTES }}'
+
+          # Build JSON with jq only (no sed)
+          jq -n \
+            --arg app           "probe-counter" \
+            --arg run_id        "${GITHUB_RUN_ID}" \
+            --arg run_attempt   "${GITHUB_RUN_ATTEMPT}" \
+            --arg repo          "${GITHUB_REPOSITORY}" \
+            --arg html_url      "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --arg status        "completed" \
+            --arg outcome       "${{ steps.decide.outputs.outcome }}" \
+            --arg message       "${{ steps.decide.outputs.message }}" \
+            --arg fail_rate     "${{ steps.decide.outputs.fail_rate }}" \
+            --arg rand          "${{ steps.decide.outputs.rand }}" \
+            --arg notes         "${NOTES_INPUT}" \
+            --argjson started_at    ${START_TS} \
+            --argjson finished_at   ${END_TS} \
+            --argjson duration_sec  $(( END_TS - START_TS )) \
+            '{
+              app: $app,
+              run_id: ($run_id|tonumber),
+              run_attempt: ($run_attempt|tonumber),
+              repository: $repo,
+              html_url: $html_url,
+              status: $status,
+              conclusion: $outcome,
+              message: $message,
+              fail_rate: ($fail_rate|tonumber),
+              rand: ($rand|tonumber),
+              notes: $notes,
+              started_at: $started_at,
+              finished_at: $finished_at,
+              duration_sec: $duration_sec
+            }' > out/result.json
+
+          echo "result_path=out/result.json" >> "$GITHUB_OUTPUT"
+          echo "=== result.json ==="
+          cat out/result.json
+
+      - name: Upload artifact (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-result
+          path: out/result.json
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Job summary (always)
+        if: always()
+        shell: bash
+        run: |
+          echo "## Probe Result" >> $GITHUB_STEP_SUMMARY
+          echo "- Outcome: **${{ steps.decide.outputs.outcome }}**" >> $GITHUB_STEP_SUMMARY
+          echo "- Fail rate: **${{ steps.decide.outputs.fail_rate }}%** (rand=${{ steps.decide.outputs.rand }})" >> $GITHUB_STEP_SUMMARY
+          echo "- Message: ${{ steps.decide.outputs.message }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Exit with chosen outcome (last step)
+        shell: bash
+        run: |
+          exit ${{ steps.decide.outputs.exitcode }}
